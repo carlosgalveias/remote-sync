@@ -2,10 +2,34 @@
 
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const server = require('socket.io')(8000);
 const ss = require('socket.io-stream');
 const { computeFileChecksum, createHashStream } = require('../common/checksum');
 const { createDecompressStream } = require('../common/compression');
+
+function getLocalIPs() {
+  const interfaces = os.networkInterfaces();
+  const addresses = [];
+  for (const name of Object.keys(interfaces)) {
+    for (const iface of interfaces[name]) {
+      // Skip internal (loopback) and non-IPv4 addresses
+      if (iface.family === 'IPv4' && !iface.internal) {
+        addresses.push({ name, address: iface.address });
+      }
+    }
+  }
+  return addresses;
+}
+
+console.log('Server listening on port 8000');
+console.log('Available on:');
+console.log('  localhost: 127.0.0.1');
+const localIPs = getLocalIPs();
+for (const { name, address } of localIPs) {
+  console.log(`  ${name}: ${address}`);
+}
+console.log('\nWaiting for connections...');
 
 server.on('connection', (socket) => {
   console.log('Client connected');
