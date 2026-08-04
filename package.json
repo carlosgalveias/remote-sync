@@ -1,0 +1,28 @@
+{
+  "name": "remote-copy",
+  "version": "0.0.1",
+  "description": "Client Server Sync Files and Folders",
+  "main": "index.js",
+  "bin": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "commander": "^9.0.0",
+    "progress-stream": "^2.0.0",
+    "socket-io": "^1.0.0",
+    "socket.io": "^4.4.1",
+    "socket.io-client": "^4.4.1",
+    "socket.io-server": "^1.0.0-b",
+    "socket.io-stream": "^0.9.1"
+  },
+  "devDependencies": {
+    "eslint": "^8.9.0",
+    "eslint-config-standard": "^16.0.3",
+    "eslint-plugin-import": "^2.25.4",
+    "eslint-plugin-node": "^11.1.0",
+    "eslint-plugin-promise": "^6.0.0"
+  }
+}
