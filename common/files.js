@@ -15,13 +15,17 @@ const listFilesFromFolder = function(folder, foundFiles) {
     return foundFiles;
   }
   for (const file of files) {
-    const filePath = path.join(folder, file);
-    const fullPath = path.resolve(filePath);
-    if (fs.statSync(filePath).isDirectory()) {
-      foundFiles.push({ file: fullPath, type: 'folder' });
-      foundFiles = foundFiles.concat(listFilesFromFolder(filePath));
-    } else {
-      foundFiles.push({ file: fullPath, type: 'file' });
+    try{
+      const filePath = path.join(folder, file);
+      const fullPath = path.resolve(filePath);
+      if (fs.statSync(filePath).isDirectory()) {
+        foundFiles.push({ file: fullPath, type: 'folder' });
+        foundFiles = foundFiles.concat(listFilesFromFolder(filePath));
+      } else {
+        foundFiles.push({ file: fullPath, type: 'file' });
+      }
+    }catch(err){
+      console.error(`[error] Error accessing file ${file}: ${err.message}`);
     }
   }
   return foundFiles;

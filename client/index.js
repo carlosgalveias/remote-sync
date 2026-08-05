@@ -131,7 +131,8 @@ function sendFileWithRetry(fileEntry, socket, opts, precomputedChecksum) {
       stream.on('error', (err) => {
         process.stdout.write('\n');
         console.error(`[error] Error sending file: ${filePath}`, err);
-        reject(err);
+        //reject(err);
+        resolve(); // dont reject, move to next file
       });
 
       if (opts.checksum) {
@@ -248,6 +249,7 @@ async function processRequest(server, folder, options = {}) {
       console.log('\n[complete] All files transferred!');
       process.exit(0);
     } catch (err) {
+      console.error(err)
       console.error('[fatal] Transfer failed:', err.message);
       process.exit(1);
     }
