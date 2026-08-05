@@ -122,4 +122,89 @@ describe('ConcurrencyPool', () => {
     expect(maxConcurrent).toBe(1);
     expect(results).toEqual([10, 20, 30]);
   });
+
+  describe('prepend()', () => {
+    it('should wrap tasks with proper lifecycle (running count and concurrency limit)', async () => {
+      const pool = new ConcurrencyPool(2);
+      let maxConcurrent = 0;
+      let currentConcurrent = 0;
+      const order = [];
+
+      const createTrackedTask = (id, ms) => () => new Promise((resolve) => {
+        currentConcurrent++;
+        maxConcurrent = Math.max(maxConcurrent, currentConcurrent);
+        order.push(id);
+        setTimeout(() => {
+          currentConcurrent--;
+          resolve(id);
+        }, ms);
+      });
+
+      // Pause pool, queue some tasks via run(), then prepend others
+      pool.pause();
+
+      // Queue via run (these go to the back)
+      const runP1 = pool.run(createTrackedTask('run-1', 30));
+      const runP2 = pool.run(createTrackedTask('run-2', 30));
+      const runP3 = pool.run(createTrackedTask('run-3', 30));
+
+      // Prepend tasks (these should go to the front)
+      const prependPromises = pool.prepend([
+        createTrackedTask('prepend-1', 30),
+        createTrackedTask('prepend-2', 30)
+      ]);
+
+      // Resume — tasks should drain respecting concurrency
+      pool.resume();
+
+      // Await all
+      const results = await Promise.all([...prependPromises, runP1, runP2, runP3]);
+
+      // Prepended tasks ran first
+      expect(order[0]).toBe('prepend-1');
+      expect(order[1]).toBe('prepend-2');
+
+      // Concurrency limit was respected
+      expect(maxConcurrent).toBeLessThanOrEqual(2);
+
+      // All tasks completed (running count decremented properly, no stall)
+      expect(results).toEqual(['prepend-1', 'prepend-2', 'run-1', 'run-2', 'run-3']);
+    });
+
+    it('should decrement running and call _next on task failure', async () => {
+      const pool = new ConcurrencyPool(1);
+      const results = [];
+
+      pool.pause();
+
+      // Prepend a failing task followed by a succeeding task
+      const prependPromises = pool.prepend([
+        () => Promise.reject(new Error('boom')),
+        () => { results.push('ok'); return Promise.resolve('ok'); }
+      ]);
+
+      pool.resume();
+
+      // First promise should reject
+      await expect(prependPromises[0]).rejects.toThrow('boom');
+      // Second should succeed (proves _next was called after failure)
+      await expect(prependPromises[1]).resolves.toBe('ok');
+      expect(results).toEqual(['ok']);
+    });
+
+    it('should start draining immediately when not paused', async () => {
+      const pool = new ConcurrencyPool(2);
+      const order = [];
+
+      // Pool is NOT paused, so prepend should start draining
+      const prependPromises = pool.prepend([
+        () => { order.push('a'); return Promise.resolve('a'); },
+        () => { order.push('b'); return Promise.resolve('b'); }
+      ]);
+
+      const results = await Promise.all(prependPromises);
+      expect(results).toEqual(['a', 'b']);
+      expect(order).toEqual(['a', 'b']);
+    });
+  });
 });

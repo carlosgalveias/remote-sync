@@ -1,331 +1,154 @@
 'use strict';
 
-let mockIoServer;
-let mockConnectionHandler;
+const path = require('path');
+const EventEmitter = require('events');
 
+// Mock http module
+jest.mock('http', () => ({
+  createServer: jest.fn(() => {
+    const server = new (require('events').EventEmitter)();
+    server.listen = jest.fn((port, cb) => {
+      setImmediate(() => cb());
+    });
+    server.close = jest.fn((cb) => {
+      if (cb) setImmediate(cb);
+    });
+    return server;
+  })
+}));
+
+// Mock socket.io Server class
 jest.mock('socket.io', () => {
   const { EventEmitter } = require('events');
-  return jest.fn((port) => {
-    mockIoServer = new EventEmitter();
-    mockIoServer.port = port;
-    const originalOn = mockIoServer.on.bind(mockIoServer);
-    mockIoServer.on = jest.fn(function(event, cb) {
-      if (event === 'connection') {
-        mockConnectionHandler = cb;
-      }
-      return originalOn(event, cb);
-    });
-    return mockIoServer;
-  });
-});
-
-jest.mock('socket.io-stream', () => {
-  const { PassThrough } = require('stream');
-  const { EventEmitter } = require('events');
-  const mockSs = jest.fn((socket) => {
-    const emitter = new EventEmitter();
-    socket._ssEmitter = emitter;
-    return emitter;
-  });
-  mockSs.createStream = jest.fn(() => new PassThrough());
-  return mockSs;
-});
-
-jest.mock('fs', () => {
-  const actualFs = jest.requireActual('fs');
-  const { PassThrough } = require('stream');
   return {
-    ...actualFs,
-    mkdirSync: jest.fn(),
-    createWriteStream: jest.fn(() => {
-      const ws = new PassThrough();
-      ws.path = '/mock/path';
-      // Simulate 'finish' event when stream ends
-      const originalEnd = ws.end.bind(ws);
-      ws.end = function(...args) {
-        originalEnd(...args);
-        setImmediate(() => ws.emit('finish'));
-      };
-      return ws;
-    }),
-    unlink: jest.fn((filePath, cb) => cb(null)),
-    promises: {
-      access: jest.fn()
-    },
-    constants: actualFs.constants
-  };
-});
-
-jest.mock('../../common/checksum', () => {
-  const { Transform } = require('stream');
-  return {
-    computeFileChecksum: jest.fn(() => Promise.resolve('abc123')),
-    createHashStream: jest.fn(() => {
-      const transform = new Transform({
-        transform(chunk, enc, cb) {
-          this.push(chunk);
-          cb();
-        }
+    Server: jest.fn(function(httpServer, options) {
+      const io = new EventEmitter();
+      io.close = jest.fn((cb) => {
+        if (cb) setImmediate(cb);
       });
-      transform.getHash = jest.fn(() => 'abc123');
-      return transform;
+      return io;
     })
   };
 });
 
-jest.mock('../../common/compression', () => {
-  const { PassThrough } = require('stream');
-  return {
-    createDecompressStream: jest.fn(() => new PassThrough())
-  };
+describe('server/index - startReceiver', () => {
+  beforeEach(() => {
+    jest.resetModules();
+    jest.spyOn(console, 'log').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it('should export startReceiver as a function', () => {
+    const { startReceiver } = require('../../server/index');
+    expect(typeof startReceiver).toBe('function');
+  });
+
+  it('should call createServer with the correct port and outputDir', async () => {
+    const { startReceiver } = require('../../server/index');
+    const result = await startReceiver({ port: 9000, outputDir: '/tmp/output' });
+
+    expect(result).toHaveProperty('io');
+    expect(result).toHaveProperty('httpServer');
+    expect(result).toHaveProperty('close');
+    expect(typeof result.close).toBe('function');
+  });
+
+  it('should use default port and CWD if no options provided', async () => {
+    const { startReceiver } = require('../../server/index');
+    const result = await startReceiver();
+
+    expect(result).toHaveProperty('io');
+    expect(result).toHaveProperty('httpServer');
+  });
 });
 
-const { EventEmitter } = require('events');
-const { PassThrough } = require('stream');
-
-describe('server/index', () => {
-  let mockServerSocket;
-
+describe('server/server - createServer', () => {
   beforeEach(() => {
-    mockServerSocket = new EventEmitter();
-    const originalEmit = mockServerSocket.emit.bind(mockServerSocket);
-    mockServerSocket.emit = jest.fn(function(event, ...args) {
-      return originalEmit(event, ...args);
-    });
+    jest.resetModules();
+    jest.spyOn(console, 'log').mockImplementation(() => {});
   });
 
-  it('should create a Socket.IO server on port 8000', () => {
-    require('../../server/index');
-    const socketIo = require('socket.io');
-    expect(socketIo).toHaveBeenCalledWith(8000);
+  afterEach(() => {
+    jest.restoreAllMocks();
   });
 
-  it('should listen for connections', () => {
-    expect(mockIoServer.on).toHaveBeenCalledWith('connection', expect.any(Function));
+  it('should export createServer as a function', () => {
+    const { createServer } = require('../../server/server');
+    expect(typeof createServer).toBe('function');
   });
 
-  it('should handle session-init and respond with session-ack', () => {
+  it('should return io, httpServer, and close function', async () => {
+    const { createServer } = require('../../server/server');
+    const result = await createServer({ port: 8888, outputDir: '/tmp' });
+
+    expect(result).toHaveProperty('io');
+    expect(result).toHaveProperty('httpServer');
+    expect(result).toHaveProperty('close');
+    expect(typeof result.close).toBe('function');
+  });
+
+  it('should register connection handler on io', async () => {
+    const { createServer } = require('../../server/server');
+    const result = await createServer({ port: 8888, outputDir: '/tmp' });
+
+    // Check that 'connection' listener is registered
+    expect(result.io.listenerCount('connection')).toBe(1);
+  });
+
+  it('should handle session-init and prevent duplicate handler registration', async () => {
+    const { createServer } = require('../../server/server');
+    const result = await createServer({ port: 8888, outputDir: '/tmp' });
+
     // Simulate a client connecting
-    mockConnectionHandler(mockServerSocket);
+    const mockSocket = new EventEmitter();
+    mockSocket.id = 'test-socket-id';
+    result.io.emit('connection', mockSocket);
 
-    // Get the session-init handler
-    const sessionInitHandler = mockServerSocket.listeners('session-init')[0];
-    expect(sessionInitHandler).toBeDefined();
+    // Get session-init listeners count
+    const sessionInitListeners = mockSocket.listenerCount('session-init');
+    expect(sessionInitListeners).toBe(1);
 
-    // Call session-init with options
-    sessionInitHandler({ compress: true, checksum: true });
+    // Call session-init twice
+    const ack1 = jest.fn();
+    const ack2 = jest.fn();
+    mockSocket.emit('session-init', { compress: true, checksum: true }, ack1);
+    mockSocket.emit('session-init', { compress: false, checksum: false }, ack2);
 
-    // Verify session-ack was emitted
-    expect(mockServerSocket.emit).toHaveBeenCalledWith('session-ack', { ok: true });
+    expect(ack1).toHaveBeenCalledWith({ ok: true });
+    expect(ack2).toHaveBeenCalledWith({ ok: true });
+
+    // file-start should only be registered once (not doubled)
+    const fileStartListeners = mockSocket.listenerCount('file-start');
+    expect(fileStartListeners).toBe(1);
   });
 
-  it('should handle session-init with callback', () => {
-    mockConnectionHandler(mockServerSocket);
+  it('should call onConnection callback when provided', async () => {
+    const onConnection = jest.fn();
+    const { createServer } = require('../../server/server');
+    const result = await createServer({ port: 8888, outputDir: '/tmp', onConnection });
 
-    const sessionInitHandler = mockServerSocket.listeners('session-init')[0];
-    const callback = jest.fn();
+    // Simulate a client connecting
+    const mockSocket = new EventEmitter();
+    mockSocket.id = 'test-socket-id';
+    result.io.emit('connection', mockSocket);
 
-    sessionInitHandler({ compress: false, checksum: true }, callback);
-
-    expect(callback).toHaveBeenCalledWith({ ok: true });
+    expect(onConnection).toHaveBeenCalledWith(mockSocket);
   });
 
-  it('should handle resume-query and respond with resume-response', async () => {
-    const { computeFileChecksum } = require('../../common/checksum');
-    const fs = require('fs');
+  it('should handle transfer-complete event', async () => {
+    const { createServer } = require('../../server/server');
+    const result = await createServer({ port: 8888, outputDir: '/tmp' });
 
-    mockConnectionHandler(mockServerSocket);
+    const mockSocket = new EventEmitter();
+    mockSocket.id = 'test-socket-id';
+    result.io.emit('connection', mockSocket);
 
-    const resumeHandler = mockServerSocket.listeners('resume-query')[0];
-    expect(resumeHandler).toBeDefined();
+    const ack = jest.fn();
+    mockSocket.emit('transfer-complete', { totalFiles: 5, totalBytes: 1024 }, ack);
 
-    // Mock: file exists and checksum matches for file1, doesn't match for file2
-    fs.promises.access.mockResolvedValue(undefined);
-    computeFileChecksum
-      .mockResolvedValueOnce('matching-checksum')
-      .mockResolvedValueOnce('actual-checksum-on-disk');
-
-    const manifest = [
-      { file: '/path/to/file1.txt', checksum: 'matching-checksum' },
-      { file: '/path/to/file2.txt', checksum: 'different-checksum' }
-    ];
-
-    await resumeHandler(manifest);
-
-    // Verify resume-response was emitted
-    expect(mockServerSocket.emit).toHaveBeenCalledWith(
-      'resume-response',
-      expect.objectContaining({
-        skip: expect.any(Array),
-        transfer: expect.any(Array)
-      })
-    );
-  });
-
-  it('should handle resume-query with callback', async () => {
-    const { computeFileChecksum } = require('../../common/checksum');
-    const fs = require('fs');
-
-    mockConnectionHandler(mockServerSocket);
-
-    const resumeHandler = mockServerSocket.listeners('resume-query')[0];
-
-    fs.promises.access.mockResolvedValue(undefined);
-    computeFileChecksum.mockResolvedValue('checksum1');
-
-    const manifest = [{ file: '/path/file.txt', checksum: 'checksum1' }];
-    const callback = jest.fn();
-
-    await resumeHandler(manifest, callback);
-
-    expect(callback).toHaveBeenCalledWith(
-      expect.objectContaining({
-        skip: expect.arrayContaining(['/path/file.txt']),
-        transfer: []
-      })
-    );
-  });
-
-  it('should handle resume-query when file does not exist on disk', async () => {
-    const fs = require('fs');
-
-    mockConnectionHandler(mockServerSocket);
-
-    const resumeHandler = mockServerSocket.listeners('resume-query')[0];
-
-    // File doesn't exist
-    fs.promises.access.mockRejectedValue(new Error('ENOENT'));
-
-    const manifest = [{ file: '/path/missing.txt', checksum: 'some-checksum' }];
-
-    await resumeHandler(manifest);
-
-    expect(mockServerSocket.emit).toHaveBeenCalledWith(
-      'resume-response',
-      expect.objectContaining({
-        skip: [],
-        transfer: ['/path/missing.txt']
-      })
-    );
-  });
-
-  it('should handle file events and write files to disk', (done) => {
-    const fs = require('fs');
-    const ss = require('socket.io-stream');
-
-    mockConnectionHandler(mockServerSocket);
-
-    // Get the socket.io-stream emitter for this socket
-    const ssEmitter = mockServerSocket._ssEmitter;
-    expect(ssEmitter).toBeDefined();
-
-    // Create a mock incoming stream
-    const incomingStream = new PassThrough();
-    const fileData = {
-      file: '/output/test-file.txt',
-      compressed: false,
-      checksum: null
-    };
-
-    // Trigger the 'file' event on ss(socket)
-    ssEmitter.emit('file', incomingStream, fileData);
-
-    // Verify mkdirSync was called
-    expect(fs.mkdirSync).toHaveBeenCalledWith('/output', { recursive: true });
-
-    // Verify createWriteStream was called
-    expect(fs.createWriteStream).toHaveBeenCalledWith('/output/test-file.txt');
-
-    // Send data through the stream
-    incomingStream.end('file content here');
-
-    // Give time for the stream to finish
-    setTimeout(() => {
-      // file-ack should be emitted since no checksum was expected
-      expect(mockServerSocket.emit).toHaveBeenCalledWith('file-ack', expect.objectContaining({
-        file: '/output/test-file.txt',
-        status: 'ok'
-      }));
-      done();
-    }, 50);
-  });
-
-  it('should verify checksums and emit file-ack with ok status on match', (done) => {
-    const { createHashStream } = require('../../common/checksum');
-    const { Transform } = require('stream');
-
-    // Setup createHashStream to return matching hash
-    createHashStream.mockReturnValue((() => {
-      const t = new Transform({
-        transform(chunk, enc, cb) { this.push(chunk); cb(); }
-      });
-      t.getHash = () => 'expected-hash';
-      return t;
-    })());
-
-    mockConnectionHandler(mockServerSocket);
-
-    const ssEmitter = mockServerSocket._ssEmitter;
-    const incomingStream = new PassThrough();
-
-    const fileData = {
-      file: '/output/verified.txt',
-      compressed: false,
-      checksum: 'expected-hash'
-    };
-
-    ssEmitter.emit('file', incomingStream, fileData);
-    incomingStream.end('verified content');
-
-    setTimeout(() => {
-      expect(mockServerSocket.emit).toHaveBeenCalledWith('file-ack', expect.objectContaining({
-        file: '/output/verified.txt',
-        status: 'ok',
-        expected: 'expected-hash',
-        received: 'expected-hash'
-      }));
-      done();
-    }, 50);
-  });
-
-  it('should emit file-ack with mismatch status on checksum failure', (done) => {
-    const fs = require('fs');
-    const { createHashStream } = require('../../common/checksum');
-    const { Transform } = require('stream');
-
-    // Setup createHashStream to return non-matching hash
-    createHashStream.mockReturnValue((() => {
-      const t = new Transform({
-        transform(chunk, enc, cb) { this.push(chunk); cb(); }
-      });
-      t.getHash = () => 'wrong-hash';
-      return t;
-    })());
-
-    mockConnectionHandler(mockServerSocket);
-
-    const ssEmitter = mockServerSocket._ssEmitter;
-    const incomingStream = new PassThrough();
-
-    const fileData = {
-      file: '/output/bad-file.txt',
-      compressed: false,
-      checksum: 'expected-hash'
-    };
-
-    ssEmitter.emit('file', incomingStream, fileData);
-    incomingStream.end('corrupted content');
-
-    setTimeout(() => {
-      expect(mockServerSocket.emit).toHaveBeenCalledWith('file-ack', expect.objectContaining({
-        file: '/output/bad-file.txt',
-        status: 'mismatch',
-        expected: 'expected-hash',
-        received: 'wrong-hash'
-      }));
-      // Verify unlink was called to clean up the bad file
-      expect(fs.unlink).toHaveBeenCalledWith('/output/bad-file.txt', expect.any(Function));
-      done();
-    }, 50);
+    expect(ack).toHaveBeenCalledWith({ ok: true });
   });
 });

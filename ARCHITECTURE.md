@@ -1,598 +1,489 @@
-# Architecture: Parallel Sending, Checksum Verification & Brotli Compression
+# Architecture
 
-## 1. Overview
+## System Overview
 
-This document describes the architecture for three new features to the `remote-sync` CLI tool:
+remote-sync is a two-process file transfer tool: a **sender** (client) reads a local folder and streams files over Socket.IO WebSockets to a **receiver** (server) that writes them atomically to disk. The protocol uses 128KB chunked binary transfer with per-chunk acknowledgements for backpressure, incremental MD5 verification, optional Brotli compression, and manifest-based resume from byte offsets.
 
-1. **Parallel File Sending** — configurable concurrency for simultaneous file transfers
-2. **Checksum Confirmation with Retry & Resume** — integrity verification, automatic retry on failure, and resume of interrupted sessions
-3. **Brotli Compression Streaming** — optional in-stream compression using Node.js built-in zlib
+## Protocol Specification
 
-### Feature Interaction
+### Transport
 
-All three features are designed to compose cleanly in the streaming pipeline:
+- Socket.IO v4 over WebSocket (`ws://`)
+- `maxHttpBufferSize`: 100 MB (allows chunks + overhead)
+- `pingTimeout`: 120,000 ms
+- `pingInterval`: 25,000 ms
+- Client transport forced to `['websocket']` (no HTTP long-polling fallback)
+
+### Event Names
+
+Defined in `common/protocol.js`:
+
+| Constant | Wire Name | Direction |
+|----------|-----------|-----------|
+| `SESSION_INIT` | `session-init` | Client → Server |
+| `FILE_START` | `file-start` | Client → Server |
+| `FILE_CHUNK` | `file-chunk` | Client → Server |
+| `FILE_END` | `file-end` | Client → Server |
+| `TRANSFER_COMPLETE` | `transfer-complete` | Client → Server |
+| `RESUME_QUERY` | `resume-query` | Client → Server |
+| `RESUME_RESPONSE` | `resume-response` | Server → Client |
+
+All events use Socket.IO's acknowledgement callback pattern (emit + ack function).
+
+### Protocol Flow
 
 ```
-ReadStream → [MD5 Hash (passthrough)] → [BrotliCompress] → socket.io-stream → [BrotliDecompress] → [MD5 Hash (passthrough)] → WriteStream
+Sender                                    Receiver
+  |                                          |
+  |──── connect (WebSocket) ────────────────>|
+  |                                          |
+  |──── session-init ───────────────────────>|
+  |<──── ack { ok: true } ──────────────────|
+  |                                          |
+  |  ┌─── per file (up to concurrency) ───┐ |
+  |  │                                     │ |
+  |  │── file-start ──────────────────────>│ |
+  |  │<── ack { ok, offset } ─────────────│ |
+  |  │                                     │ |
+  |  │   (if offset === size → skip)       │ |
+  |  │                                     │ |
+  |  │── file-chunk ──────────────────────>│ |
+  |  │<── ack { ok } ────────────────────-│ |
+  |  │   ... repeat for each chunk ...     │ |
+  |  │                                     │ |
+  |  │── file-end ────────────────────────>│ |
+  |  │<── ack { ok, status } ─────────────│ |
+  |  │                                     │ |
+  |  └────────────────────────────────────-┘ |
+  |                                          |
+  |──── transfer-complete ──────────────────>|
+  |<──── ack { ok } ────────────────────────|
+  |                                          |
+  |──── disconnect ─────────────────────────>|
 ```
 
-- **Parallel sending** manages *N* such pipelines concurrently
-- **Checksum** is computed on **original uncompressed data** (both sides), ensuring integrity of the actual file content regardless of compression
-- **Compression** is transparent to the checksum layer — the hash taps into the stream before compression (sender) and after decompression (receiver)
-- **Resume** leverages checksums to skip already-transferred files
+### Payload Formats
 
-### Interaction Matrix
+#### `session-init` (Client → Server)
 
-| Feature | Parallel | Checksum | Compression |
-|---------|----------|----------|-------------|
-| **Parallel** | — | Each transfer independently verifies | Each stream independently compresses |
-| **Checksum** | Works per-file in parallel | — | Hash computed on uncompressed data |
-| **Compression** | Each stream has own Brotli instance | Transparent to checksum | — |
-
----
-
-## 2. Protocol Changes
-
-### 2.1 New Events
-
-| Event | Direction | Payload | Purpose |
-|-------|-----------|---------|---------|
-| `session-init` | Client → Server | `{ compression, concurrency, resume }` | Negotiate session capabilities |
-| `session-ack` | Server → Client | `{ ready: true }` | Confirm session parameters accepted |
-| `resume-query` | Client → Server | `{ files: [{ file, size, checksum }] }` | Ask server which files need transfer |
-| `resume-response` | Server → Client | `{ skip: [filePath], transfer: [filePath] }` | Server responds with skip/transfer lists |
-| `file` | Client → Server | stream + `{ file, size, checksum, compressed, transferId }` | Modified: now includes checksum and metadata |
-| `file-ack` | Server → Client | `{ transferId, file, status, serverChecksum }` | Server confirms file integrity |
-| `transfer-complete` | Client → Server | `{ totalFiles, totalBytes }` | Signal all files sent |
-
-### 2.2 Modified Metadata for `file` Event
-
-Current metadata:
-```js
-{ file: absolutePath }
-```
-
-New metadata:
-```js
+```json
 {
-  file: absolutePath,        // unchanged
-  size: number,             // file size in bytes (original, uncompressed)
-  checksum: string,         // MD5 hex digest of original file
-  compressed: boolean,      // whether stream is Brotli-compressed
-  transferId: string        // unique ID for this transfer (for ack correlation)
+  "sessionId": "uuid-v4",
+  "compress": false,
+  "checksum": true,
+  "resume": true
 }
 ```
 
-### 2.3 Handshake Flow
+**Ack:** `{ "ok": true }`
 
-```
-Client connects → emits 'session-init' → Server responds 'session-ack'
-  → (if resume) Client emits 'resume-query' → Server responds 'resume-response'
-  → Client begins file transfers
-```
+#### `file-start` (Client → Server)
 
----
-
-## 3. Client-Side Changes
-
-### 3.1 File: `client/index.js`
-
-**Current flow:** Sequential `for...of` loop calling `await sendFile()`.
-
-**New flow:**
-
-```js
-// Pseudocode for new processList
-async function processList(fileList, socket, options) {
-  const { concurrency, compress, compressLevel, maxRetries } = options;
-
-  // 1. Compute checksums for all files (can be parallelized)
-  const manifest = await buildManifest(fileList);
-
-  // 2. Resume check - ask server which files to skip
-  const filesToSend = await resumeCheck(socket, manifest);
-
-  // 3. Send files with concurrency limit
-  const pool = new ConcurrencyPool(concurrency);
-  const results = [];
-
-  for (const entry of filesToSend) {
-    pool.add(async () => {
-      let attempts = 0;
-      let success = false;
-      while (!success && attempts < maxRetries) {
-        attempts++;
-        success = await sendFileWithVerification(entry, socket, { compress, compressLevel });
-        if (!success) console.warn(`Retry ${attempts}/${maxRetries}: ${entry.file}`);
-      }
-      results.push({ file: entry.file, success, attempts });
-    });
-  }
-
-  await pool.drain();
-  socket.emit('transfer-complete', { totalFiles: results.length });
-  printSummary(results);
-  process.exit(0);
+```json
+{
+  "fileKey": "src/utils/helper.js",
+  "size": 4096,
+  "mtime": 1704067200000,
+  "compressed": false,
+  "checksum": true,
+  "resume": true
 }
 ```
 
-### 3.2 New `sendFileWithVerification` Function
-
-Replaces current `sendFile`. Key differences:
-
-1. Generates a `transferId` (e.g., `crypto.randomUUID()`)
-2. Computes MD5 checksum via a passthrough hash stream
-3. Optionally pipes through `zlib.createBrotliCompress()`
-4. Waits for `file-ack` event from server before resolving
-5. Returns `true` on checksum match, `false` on mismatch
-
-### 3.3 Streaming Pipeline (Client)
-
-```
-fs.createReadStream(file)
-  → crypto hash (passthrough, computes MD5)
-  → progress-stream (for reporting)
-  → [optional: zlib.createBrotliCompress()]
-  → socket.io-stream
-```
-
-### 3.4 Progress Reporting for Parallel Transfers
-
-- Each active transfer maintains its own progress state
-- A `ProgressReporter` class manages multi-line terminal output
-- Uses ANSI escape codes to update multiple lines in-place
-- Falls back to single-line rolling output if terminal does not support multi-line
-
----
-
-## 4. Server-Side Changes
-
-### 4.1 File: `server/index.js`
-
-**New responsibilities:**
-
-1. Handle `session-init` — store session parameters
-2. Handle `resume-query` — scan local files, compute checksums, respond with skip/transfer lists
-3. Handle `file` events with new metadata — decompress if needed, compute checksum, send `file-ack`
-4. Support multiple simultaneous writes (already works with current architecture since each `file` event creates an independent WriteStream)
-
-### 4.2 Receiving Pipeline (Server)
-
-```
-socket.io-stream (incoming)
-  → [optional: zlib.createBrotliDecompress()]
-  → crypto hash (passthrough, computes MD5)
-  → fs.createWriteStream(file)
-```
-
-On WriteStream `finish` event:
-1. Get final MD5 digest from hash
-2. Compare with `fileData.checksum` from metadata
-3. Emit `file-ack` with match/mismatch status
-4. On mismatch: delete the corrupted file
-
-### 4.3 Resume Query Handler
-
-```js
-socket.on('resume-query', async ({ files }) => {
-  const skip = [];
-  const transfer = [];
-
-  for (const { file, size, checksum } of files) {
-    if (fs.existsSync(file)) {
-      const localChecksum = await computeFileChecksum(file);
-      const localSize = fs.statSync(file).size;
-      if (localChecksum === checksum && localSize === size) {
-        skip.push(file);
-        continue;
-      }
-    }
-    transfer.push(file);
-  }
-
-  socket.emit('resume-response', { skip, transfer });
-});
-```
-
----
-
-## 5. New CLI Options
-
-### `send` Command
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-c, --concurrency <number>` | Number of parallel file transfers | `5` |
-| `-z, --compress` | Enable Brotli compression | `false` |
-| `--compress-level <number>` | Brotli quality level (1-11) | `3` |
-| `--no-checksum` | Disable checksum verification | checksum enabled |
-| `--retries <number>` | Max retry attempts on checksum mismatch | `3` |
-| `--resume` | Resume a previous interrupted transfer | `false` |
-
-### `receive` Command
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-p, --port <number>` | Server listening port | `8000` |
-| `-o, --output <folder>` | Output directory (override received paths) | *use sender paths* |
-
-### Updated `index.js` Example
-
-```js
-program.command('send')
-  .description('copy folder to receiver')
-  .option('-a, --address <ip>', 'ip address', '127.0.0.1')
-  .option('-f, --folder <folder>', 'Folder to send', process.cwd())
-  .option('-c, --concurrency <number>', 'parallel transfers', '5')
-  .option('-z, --compress', 'enable Brotli compression', false)
-  .option('--compress-level <number>', 'Brotli quality (1-11)', '3')
-  .option('--no-checksum', 'disable checksum verification')
-  .option('--retries <number>', 'max retries on failure', '3')
-  .option('--resume', 'resume interrupted transfer', false)
-  .action((opt) => { /* ... */ });
-```
-
----
-
-## 6. New Dependencies
-
-| Package | Purpose | Built-in? |
-|---------|---------|-----------|
-| `crypto` | MD5 hashing via `crypto.createHash('md5')` | ✅ Yes |
-| `zlib` | `createBrotliCompress()` / `createBrotliDecompress()` | ✅ Yes |
-| `stream` | `PassThrough`, `pipeline()` | ✅ Yes |
-| `p-limit` | Concurrency pool for parallel transfers | ❌ No (npm) |
-
-**Rationale for `p-limit`:** While a custom concurrency limiter could be written, `p-limit` is a zero-dependency, well-tested 50-line module. Alternatively, a custom implementation in `common/concurrency.js` avoids any new dependency.
-
-**Rationale for MD5:** For integrity checking on a LAN (not security), MD5 is the fastest built-in hash in Node.js. SHA-256 is ~2x slower. XXHash would be faster but requires a native/WASM dependency (`xxhash-wasm`). MD5 provides the best balance of speed and zero-dependency for this use case.
-
-**No new npm dependencies are strictly required** — all features can be implemented with Node.js built-in modules plus a ~30 line concurrency helper.
-
----
-
-## 7. File Structure Changes
-
-```
-remote-sync/
-├── index.js                    # Modified: new CLI options
-├── package.json                # Modified: version bump
-├── ARCHITECTURE.md             # New: this document
-├── client/
-│   ├── index.js                # Modified: orchestration with concurrency + resume
-│   ├── sender.js               # New: single-file send with checksum + compression
-│   └── progress.js             # New: multi-transfer progress reporter
-├── server/
-│   ├── index.js                # Modified: session handling, ack events
-│   └── receiver.js             # New: single-file receive with checksum + decompression
-├── common/
-│   ├── files.js                # Unchanged
-│   ├── checksum.js             # New: MD5 hash computation (file + stream)
-│   ├── compression.js          # New: Brotli stream factory
-│   └── concurrency.js          # New: promise concurrency pool (replaces p-limit)
-└── plans/
-    └── ...
-```
-
-### New Module Descriptions
-
-| Module | Exports | Responsibility |
-|--------|---------|---------------|
-| `common/checksum.js` | `computeFileChecksum(filePath)`, `createHashPassthrough()` | Compute MD5 of file or create a passthrough stream that computes hash |
-| `common/compression.js` | `createCompressor(level)`, `createDecompressor()` | Factory for Brotli compress/decompress transform streams |
-| `common/concurrency.js` | `ConcurrencyPool` class | Limits concurrent async operations to N |
-| `client/sender.js` | `sendFile(entry, socket, options)` | Handles single file: pipeline assembly, checksum, ack waiting |
-| `client/progress.js` | `ProgressReporter` class | Manages multi-line progress display for concurrent transfers |
-| `server/receiver.js` | `receiveFile(stream, fileData, socket)` | Handles single file: pipeline assembly, checksum verification, ack emission |
-
----
-
-## 8. Sequence Diagrams
-
-### 8.1 Session Initialization with Resume
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant S as Server
-
-    C->>S: connect via WebSocket
-    S-->>C: connection established
-
-    C->>S: session-init {compression: true, concurrency: 5, resume: true}
-    S-->>C: session-ack {ready: true}
-
-    Note over C: Build manifest - compute checksums for all files
-    C->>S: resume-query {files: [{file, size, checksum}, ...]}
-    Note over S: Check local files against manifest
-    S-->>C: resume-response {skip: [...], transfer: [...]}
-
-    Note over C: Begin parallel transfers for files in transfer list
-```
-
-### 8.2 Single File Transfer with Checksum and Compression
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant S as Server
-
-    Note over C: Assemble pipeline: ReadStream -> MD5 -> Brotli -> Stream
-    C->>S: file event [stream + {file, size, checksum, compressed: true, transferId: abc123}]
-
-    Note over S: Receive pipeline: Stream -> BrotliDecompress -> MD5 -> WriteStream
-    Note over S: WriteStream finishes
-
-    alt Checksum matches
-        S-->>C: file-ack {transferId: abc123, status: ok, serverChecksum: ...}
-        Note over C: Mark file as successfully transferred
-    else Checksum mismatch
-        S-->>C: file-ack {transferId: abc123, status: mismatch, serverChecksum: ...}
-        Note over S: Delete corrupted file
-        Note over C: Queue file for retry
-    end
-```
-
-### 8.3 Parallel Transfer Flow
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant S as Server
-
-    Note over C: Concurrency pool with limit=3
-
-    par File A
-        C->>S: file event [streamA + metadataA]
-        Note over S: Writing fileA...
-    and File B
-        C->>S: file event [streamB + metadataB]
-        Note over S: Writing fileB...
-    and File C
-        C->>S: file event [streamC + metadataC]
-        Note over S: Writing fileC...
-    end
-
-    S-->>C: file-ack {transferId: A, status: ok}
-    Note over C: Slot freed - start File D
-
-    S-->>C: file-ack {transferId: B, status: mismatch}
-    Note over C: Slot freed - retry File B
-
-    S-->>C: file-ack {transferId: C, status: ok}
-    Note over C: Slot freed - start File E
-
-    par File D
-        C->>S: file event [streamD + metadataD]
-    and File B retry
-        C->>S: file event [streamB + metadataB]
-    and File E
-        C->>S: file event [streamE + metadataE]
-    end
-
-    C->>S: transfer-complete {totalFiles: N, totalBytes: M}
-```
-
-### 8.4 Complete Pipeline Detail
-
-```mermaid
-flowchart LR
-    subgraph Client
-        RS[ReadStream] --> HP[Hash Passthrough MD5]
-        HP --> PS[Progress Stream]
-        PS --> BC[BrotliCompress]
-        BC --> SOS[socket.io-stream]
-    end
-
-    SOS -->|network| SIS
-
-    subgraph Server
-        SIS[socket.io-stream] --> BD[BrotliDecompress]
-        BD --> HPR[Hash Passthrough MD5]
-        HPR --> WS[WriteStream]
-    end
-
-    WS -->|finish| VER{Verify Checksum}
-    VER -->|match| ACK[emit file-ack ok]
-    VER -->|mismatch| NACK[emit file-ack mismatch + delete]
-```
-
----
-
-## 9. Edge Cases and Error Handling
-
-### 9.1 Network & Connection
-
-| Scenario | Handling |
-|----------|----------|
-| Connection drops mid-transfer | Client detects disconnect, aborts in-flight transfers, logs which files were incomplete. On reconnect with `--resume`, skips completed files. |
-| Server not reachable | Client retries connection 3 times with exponential backoff, then exits with error |
-| Socket timeout during large file | Increase Socket.IO `pingTimeout` to 120s for large transfers |
-
-### 9.2 Checksum & Integrity
-
-| Scenario | Handling |
-|----------|----------|
-| Checksum mismatch | Server deletes partial/corrupted file, sends `mismatch` ack, client retries up to `--retries` times |
-| All retries exhausted | Log the file as failed, continue with other files, report in final summary |
-| File changes during checksum computation | Use file size + mtime check; if file changes between hash and send, recompute |
-| Empty file (0 bytes) | Still compute checksum (MD5 of empty = d41d8cd98f00b204e9800998ecf8427e), still verify |
-
-### 9.3 Compression
-
-| Scenario | Handling |
-|----------|----------|
-| Already-compressed files (zip, jpg, mp4) | Still apply Brotli at quality 1 — minimal overhead, consistent pipeline. Future: skip compression for known compressed extensions |
-| Brotli stream error | Catch error on transform stream, treat as transfer failure, retry without compression on that file |
-| Server receives uncompressed when expecting compressed | `compressed` flag in metadata tells server whether to decompress; mismatch in flag = protocol error, reject transfer |
-
-### 9.4 Parallel Transfers
-
-| Scenario | Handling |
-|----------|----------|
-| One file blocks others (very large file) | Each file is independent; other slots continue. Large files do not block small ones. |
-| Too many concurrent streams overwhelm network | Default concurrency of 5 is conservative for LAN. User can reduce with `-c 1` for constrained networks. |
-| Memory pressure from many concurrent reads | Each ReadStream uses default 64KB highWaterMark. At concurrency 5, thats ~320KB read buffer — negligible. |
-| File not found (deleted between scan and send) | Catch ENOENT, log warning, skip file, do not retry |
-| Permission denied on server write | Server sends `file-ack` with `status: error` and `reason`, client logs and skips |
-
-### 9.5 Resume
-
-| Scenario | Handling |
-|----------|----------|
-| Partially written file on server | `resume-query` compares checksum — partial file will have wrong checksum, so it gets re-transferred |
-| File modified on sender since last attempt | New checksum wont match server copy, so file gets re-transferred |
-| Thousands of files in resume-query | Batch the manifest in chunks of 500 files to avoid oversized messages |
-| Server has file with correct size but wrong checksum | Checksum takes priority — file is re-transferred |
-
----
-
-## 10. Recommended Defaults
-
-| Setting | Default | Rationale |
-|---------|---------|-----------|
-| Concurrency | `5` | Balances throughput vs resource usage on WiFi. Gigabit LAN could handle 10+, but 5 is safe for all LAN types |
-| Compression | `disabled` | On Gigabit LAN, compression adds CPU cost without bandwidth savings. Useful for slower WiFi or large text files |
-| Brotli quality | `3` | Quality 1-4 is the fast range. 3 gives ~2x compression on text with minimal CPU. Quality 0 is too low ratio, 4+ gets diminishing returns |
-| Checksum | `enabled` | Integrity verification is critical; MD5 overhead is <5% on modern CPUs |
-| Max retries | `3` | On LAN, corruption is rare; 3 retries is more than sufficient |
-| Resume | `disabled` | Must be explicitly opted-in since it requires server-side checksum computation of existing files which can be slow for large directories |
-| Hash algorithm | `MD5` | Fastest built-in Node.js hash. Not used for security, only integrity. ~800 MB/s throughput on modern hardware |
-| Socket.IO pingTimeout | `120000` (ms) | Large files may cause apparent inactivity; 2 minutes prevents false disconnects |
-| Socket.IO maxHttpBufferSize | `1e8` (100MB) | Allows large metadata payloads for resume manifests with many files |
-
----
-
-## Appendix A: `common/checksum.js` Interface
-
-```js
-const crypto = require('crypto');
-const fs = require('fs');
-const { pipeline } = require('stream/promises');
-
-/**
- * Compute MD5 checksum of a file on disk.
- * @param {string} filePath - Absolute path to file
- * @returns {Promise<string>} Hex-encoded MD5 digest
- */
-async function computeFileChecksum(filePath) {
-  const hash = crypto.createHash('md5');
-  const stream = fs.createReadStream(filePath);
-  await pipeline(stream, hash);
-  return hash.digest('hex');
+**Ack:** `{ "ok": true, "offset": 0 }`
+
+- `offset === 0` → transfer from beginning
+- `offset === size` → file already complete, skip it
+- `0 < offset < size` → resume from that byte
+
+#### `file-chunk` (Client → Server)
+
+```json
+{
+  "fileKey": "src/utils/helper.js",
+  "index": 0,
+  "data": <Buffer>
 }
-
-/**
- * Create a passthrough transform that computes MD5 on flowing data.
- * Call .digest('hex') on the returned object after stream ends.
- * @returns {{ stream: Transform, getDigest: () => string }}
- */
-function createHashPassthrough() {
-  const hash = crypto.createHash('md5');
-  const { PassThrough } = require('stream');
-  const pt = new PassThrough();
-  pt.on('data', (chunk) => hash.update(chunk));
-  return {
-    stream: pt,
-    getDigest: () => hash.digest('hex')
-  };
-}
-
-module.exports = { computeFileChecksum, createHashPassthrough };
 ```
 
-## Appendix B: `common/compression.js` Interface
+`data` is a raw `Buffer` (binary). If compression enabled, `data` contains independently Brotli-compressed chunk data.
 
-```js
-const zlib = require('zlib');
+**Ack:** `{ "ok": true }`
 
-/**
- * Create a Brotli compression transform stream.
- * @param {number} level - Brotli quality (1-11), default 3
- * @returns {Transform}
- */
-function createCompressor(level = 3) {
-  return zlib.createBrotliCompress({
-    params: {
-      [zlib.constants.BROTLI_PARAM_QUALITY]: level
-    }
-  });
+On error: `{ "ok": false, "error": "message" }`
+
+#### `file-end` (Client → Server)
+
+```json
+{
+  "fileKey": "src/utils/helper.js",
+  "md5": "d41d8cd98f00b204e9800998ecf8427e",
+  "totalChunks": 1,
+  "totalBytes": 4096
 }
-
-/**
- * Create a Brotli decompression transform stream.
- * @returns {Transform}
- */
-function createDecompressor() {
-  return zlib.createBrotliDecompress();
-}
-
-module.exports = { createCompressor, createDecompressor };
 ```
 
-## Appendix C: `common/concurrency.js` Interface
+`md5` is `null` if checksums are disabled.
 
-```js
-/**
- * A simple concurrency pool that limits parallel async operations.
- * Zero dependencies — replaces p-limit.
- */
-class ConcurrencyPool {
-  constructor(limit) {
-    this.limit = limit;
-    this.active = 0;
-    this.queue = [];
-  }
+**Ack (success):** `{ "ok": true, "status": "verified" }`
 
-  add(fn) {
-    return new Promise((resolve, reject) => {
-      this.queue.push({ fn, resolve, reject });
-      this._next();
-    });
-  }
+**Ack (mismatch):** `{ "ok": false, "status": "checksum_mismatch", "expected": "...", "received": "..." }`
 
-  _next() {
-    while (this.active < this.limit && this.queue.length > 0) {
-      const { fn, resolve, reject } = this.queue.shift();
-      this.active++;
-      fn()
-        .then(resolve)
-        .catch(reject)
-        .finally(() => {
-          this.active--;
-          this._next();
-        });
+#### `transfer-complete` (Client → Server)
+
+```json
+{
+  "sessionId": "uuid-v4",
+  "totalFiles": 500,
+  "totalBytes": 104857600,
+  "skipped": 12
+}
+```
+
+**Ack:** `{ "ok": true }`
+
+## Module Responsibilities
+
+### `index.js` — CLI Entry Point
+
+Parses commands and options using Commander.js. Validates port numbers (1–65535), concurrency (1–100), and non-negative integers. Routes to `startReceiver()` or `runSendSession()`. Enforces mutual exclusivity of `--verbose` and `--quiet`.
+
+### `client/index.js` — Send Orchestration
+
+Top-level sender logic. Lists files, creates Socket.IO connection, initializes session, builds a concurrency pool of per-file tasks wrapped in retry logic, manages progress rendering, handles SIGINT and global timeout, emits `transfer-complete`, and determines exit code. Contains the `dryRun()` function that lists files without connecting.
+
+### `client/connection.js` — Socket.IO Client Wrapper
+
+Creates Socket.IO client with `ws://` transport. Provides `connectAndWait()` (connection with timeout), `emitWithAck()` (emit with ack timeout — default 30s), and `attachReconnectionHandlers()` for lifecycle events (disconnect, reconnect_attempt, reconnect, reconnect_failed).
+
+### `client/sender.js` — Chunked File Sender
+
+Implements `sendFile()`: emits `file-start`, reads file asynchronously in 128KB chunks, compresses per-chunk if enabled, hashes incrementally, emits `file-chunk` with backpressure (waits for ack), emits `file-end` with full-file MD5. Handles resume by fast-forwarding the hash through already-sent bytes from local disk.
+
+### `client/progress.js` — Progress Renderer
+
+Single-line progress bar with EWMA-smoothed throughput (α=0.3). Renders `[####    ] N/M files  X.X files/s  ETA HH:MM:SS`. Detects TTY vs non-TTY. Non-TTY emits plain lines every 5 seconds. Throttles redraws to 100ms. Handles above-bar warnings without corrupting display. Renders final summary line on completion.
+
+### `client/resilience.js` — Retry & State Management
+
+Contains:
+- **Error classification** — `isRetriable()` checks against permanent codes (`EACCES`, `ENOENT`, `EISDIR`, `EPERM`, `ENAMETOOLONG`) and messages (path traversal)
+- **`withRetry()`** — async retry wrapper with exponential backoff (base 1s, max 30s, jitter 500ms) and cancellable delays
+- **`InFlightTracker`** — tracks files currently transferring, supports pause/resume on disconnect
+- **`ConnectionStateMachine`** — states: `connecting` → `connected` → `transferring` → `reconnecting` → `dead`
+- **`setupSigintHandler()`** — first Ctrl+C: pause pool + grace period (10s default); second: force quit; third: `process.exit(130)`
+- **`writeFailureReport()`** — writes `failed-files.json` on partial failure
+
+### `client/logger.js` — Log File Writer
+
+Append-mode file writer with ISO timestamps. Four levels: error, warn, info, debug. Console output respects verbosity (quiet=error only, default=info, verbose=debug). Log file always writes at debug level. Integrates with progress renderer for above-bar output.
+
+### `server/index.js` — Receiver Entry
+
+Thin wrapper that resolves `outputDir` and delegates to `createServer()`.
+
+### `server/server.js` — Socket.IO Server Factory
+
+Creates HTTP server + Socket.IO instance. Handles `session-init` (sets session options, registers file handlers once per connection), `transfer-complete`, and `disconnect`. Displays local network IPs on startup. Calls `initReceiverResume()` on startup to reconcile manifest.
+
+### `server/receiver.js` — Chunk Assembly & Atomic Writes
+
+Registers per-socket event handlers for `file-start`, `file-chunk`, `file-end`. Manages per-file state (fd, hash, partPath, finalPath, bytesWritten). Decompresses chunks if compressed. Writes to `.part` file at tracked position. On `file-end`: verifies MD5, fsync, rename to final path. On disconnect: fsync all active `.part` files and flush manifest.
+
+### `server/manifest.js` — Persistent Resume Manifest
+
+In-memory cached manifest with atomic disk persistence (write to `.tmp` → fsync → rename). Tracks per-file state: `{ expectedSize, bytesWritten, status, lastModified, expectedChecksum }`. Key functions:
+- `determineOffset()` — resume decision logic
+- `markComplete()` — always flushes to disk
+- `registerPartial()` — flushes every 10 calls (batched I/O)
+- `reconcile()` — startup cleanup of stale `.part` files
+- `flushManifest()` — force flush on disconnect
+
+### `common/protocol.js` — Shared Constants
+
+Defines `CHUNK_SIZE` (131072 bytes = 128KB), `EVENTS` map, `DEFAULT_PORT` (8000), `MAX_HTTP_BUFFER_SIZE` (100MB), `PING_TIMEOUT` (120s), `PING_INTERVAL` (25s).
+
+### `common/files.js` — Directory Scanner & Path Safety
+
+`listFiles()` — recursive synchronous directory walk. Returns `{ relativePath, absolutePath, size, mtime }`. Skips `.remote-sync` at any nesting level.
+
+`toWireKey()` — converts absolute path to POSIX-relative wire key. Rejects `..` and leading `/`.
+
+`fromWireKey()` — converts wire key to local path. Rejects `..`, leading `/`, and backslashes. Verifies resolved path stays within output directory.
+
+### `common/compression.js` — Brotli Utilities
+
+Exports `DEFAULT_BROTLI_OPTIONS` with quality 3 (speed-optimized). Provides `createCompressStream()` and `createDecompressStream()` factory functions. Sender uses `promisify(zlib.brotliCompress)` with these options for per-chunk async compression.
+
+### `common/concurrency.js` — ConcurrencyPool
+
+Manages parallel task execution with configurable slot count. Provides `runAllSettled()` (returns succeeded/failed arrays), `pause()`, `resume()`. Per-task isolation ensures one failure doesn't affect others.
+
+## Resume Algorithm
+
+```
+determineOffset(outputDir, wireKey, expectedSize, expectedChecksum, resume):
+│
+├─ resume === false?
+│   └─ return 0 (always overwrite)
+│
+├─ manifest has entry with status === 'complete'?
+│   ├─ entry.expectedSize === expectedSize?
+│   │   ├─ checksums both available and match?
+│   │   │   ├─ final file exists on disk with correct size?
+│   │   │   │   └─ return expectedSize (SKIP)
+│   │   │   └─ file missing → return 0
+│   │   ├─ no checksum comparison → file exists with correct size?
+│   │   │   └─ return expectedSize (SKIP) or 0
+│   │   └─ size mismatch → return 0
+│   └─ size mismatch → return 0
+│
+├─ manifest has entry with status === 'partial' AND expectedSize matches?
+│   ├─ .part file exists on disk?
+│   │   ├─ partSize > 0 AND partSize < expectedSize?
+│   │   │   └─ return floor(partSize / CHUNK_SIZE) * CHUNK_SIZE (chunk-aligned)
+│   │   └─ partSize >= expectedSize → return 0 (corrupted)
+│   └─ .part file missing → return 0
+│
+└─ default: return 0 (fresh transfer)
+```
+
+## Resilience Model
+
+### Connection State Machine
+
+```
+                    ┌──────────────────┐
+          connect   │                  │  session-init ack
+     ┌─────────────>│   CONNECTED      │──────────────────┐
+     │              │                  │                   │
+     │              └────────┬─────────┘                   v
+     │                       │                    ┌──────────────────┐
+     │              transfer │                    │                  │
+     │              starts   │                    │  TRANSFERRING    │
+     │                       │                    │                  │
+     │                       v                    └────────┬─────────┘
+┌────┴─────┐                                              │
+│           │         disconnect                          │ disconnect
+│ CONNECTING│<───────────────────┐                        │
+│           │                    │                        │
+└───────────┘                    │                        v
+                         ┌───────┴──────────┐
+                         │                  │   attempts > 10
+                         │  RECONNECTING    │────────────────────┐
+                         │                  │                    │
+                         └──────────────────┘                    v
+                                                      ┌──────────────────┐
+                                                      │                  │
+                                                      │      DEAD        │
+                                                      │                  │
+                                                      └──────────────────┘
+```
+
+### Retry Policy
+
+- **Max attempts** = `retries + 1` (default 4 total: 1 initial + 3 retries)
+- **Backoff**: `min(1000 * 2^attempt + random(0, 500), 30000)` ms
+- **Non-retryable errors** abort immediately (no backoff)
+- **Abort conditions**: SIGINT in progress, global timeout reached
+
+### SIGINT Handling
+
+1. **First Ctrl+C**: Pause pool (no new tasks start). Grace period (10s) for in-flight to finish. If all drain → clean exit.
+2. **Second Ctrl+C**: Force quit. Write failure report with in-flight snapshot.
+3. **Third+ Ctrl+C**: `process.exit(130)`.
+
+### Reconnection
+
+- Socket.IO built-in reconnection: 10 attempts, 1s base delay, 30s max delay
+- On reconnect: re-emit `session-init` to re-register handlers
+- In-flight files are paused on disconnect, resumed on reconnect
+- If all 10 attempts fail → state machine transitions to DEAD → exit code 2
+
+## Data Flow Diagrams
+
+### Sender Pipeline (per file)
+
+```
+┌──────────────┐     ┌──────────────┐     ┌────────────────┐
+│ Open file    │────>│ Read 128KB   │────>│ Hash chunk     │
+│ (async)      │     │ (async I/O)  │     │ (MD5 update)   │
+└──────────────┘     └──────────────┘     └───────┬────────┘
+                                                   │
+                          ┌────────────────────────┘
+                          v
+                   ┌────────────────┐     ┌────────────────┐
+                   │ Compress chunk │────>│ Emit chunk     │
+                   │ (Brotli, opt)  │     │ + wait ack     │
+                   └────────────────┘     └───────┬────────┘
+                                                   │
+                          ┌────────────────────────┘
+                          v
+                   ┌────────────────┐
+                   │ More chunks?   │──── yes ──> loop back to Read
+                   └───────┬────────┘
+                           │ no
+                           v
+                   ┌────────────────┐     ┌────────────────┐
+                   │ Finalize MD5   │────>│ Emit file-end  │
+                   │ hash.digest()  │     │ + wait ack     │
+                   └────────────────┘     └────────────────┘
+```
+
+### Receiver Pipeline (per file)
+
+```
+┌────────────────┐     ┌────────────────┐     ┌────────────────┐
+│ file-start     │────>│ Determine      │────>│ Open .part     │
+│ received       │     │ resume offset  │     │ (create/append)│
+└────────────────┘     └────────────────┘     └───────┬────────┘
+                                                       │
+                          ┌────────────────────────────┘
+                          v
+                   ┌────────────────┐     ┌────────────────┐
+                   │ file-chunk     │────>│ Decompress     │
+                   │ received       │     │ (if compressed)│
+                   └────────────────┘     └───────┬────────┘
+                                                   │
+                          ┌────────────────────────┘
+                          v
+                   ┌────────────────┐     ┌────────────────┐
+                   │ Hash chunk     │────>│ Write to .part │
+                   │ (MD5 update)   │     │ at position    │
+                   └────────────────┘     └───────┬────────┘
+                                                   │
+                          ┌────────────────────────┘
+                          v
+                   ┌────────────────┐
+                   │ file-end       │
+                   │ received       │
+                   └───────┬────────┘
+                           │
+                           v
+                   ┌────────────────┐     ┌────────────────┐
+                   │ Verify MD5     │────>│ fsync + rename │
+                   │ (if enabled)   │     │ .part → final  │
+                   └────────────────┘     └───────┬────────┘
+                                                   │
+                                                   v
+                                          ┌────────────────┐
+                                          │ Mark complete  │
+                                          │ in manifest    │
+                                          └────────────────┘
+```
+
+## Configuration
+
+### Server (Receiver) Options
+
+| Parameter | Source | Default | Notes |
+|-----------|--------|---------|-------|
+| `port` | CLI `-p` | `8000` | `DEFAULT_PORT` from protocol.js |
+| `outputDir` | CLI `-o` | `process.cwd()` | Resolved to absolute path |
+| `verbose` | CLI `-v` | `false` | |
+| `quiet` | CLI `-q` | `false` | Mutually exclusive with verbose |
+| `logFile` | CLI `--log-file` | `null` | |
+| `maxHttpBufferSize` | Hardcoded | 100 MB | In protocol.js |
+| `pingTimeout` | Hardcoded | 120,000 ms | In protocol.js |
+| `pingInterval` | Hardcoded | 25,000 ms | In protocol.js |
+
+### Client (Sender) Options
+
+| Parameter | Source | Default | Notes |
+|-----------|--------|---------|-------|
+| `address` | CLI `-a` | `127.0.0.1` | |
+| `port` | CLI `-p` | `8000` | |
+| `folder` | CLI `-f` | `process.cwd()` | Resolved to absolute path |
+| `concurrency` | CLI `-c` | `5` | Range: 1–100 |
+| `compress` | CLI `-z` | `false` | Brotli quality 3 |
+| `checksum` | CLI `--no-checksum` | `true` | MD5 full-file verification |
+| `retries` | CLI `-r` | `3` | Total attempts = retries + 1 |
+| `resume` | CLI `--no-resume` | `true` | |
+| `timeout` | CLI `--timeout` | `30000` ms | Per-chunk ack timeout |
+| `globalTimeout` | CLI `--global-timeout` | `0` | 0 = no limit |
+| `dryRun` | CLI `--dry-run` | `false` | No network connection |
+| `verbose` | CLI `-v` | `false` | |
+| `quiet` | CLI `-q` | `false` | |
+| `logFile` | CLI `--log-file` | `null` | |
+| `stallTimeout` | Internal | `30000` ms | Same as chunk timeout |
+| `graceTimeout` | Internal | `10000` ms | SIGINT grace period |
+| `reconnectionAttempts` | Hardcoded | `10` | Socket.IO reconnect attempts |
+| `reconnectionDelay` | Hardcoded | `1000` ms | Base reconnect delay |
+| `reconnectionDelayMax` | Hardcoded | `30000` ms | Max reconnect delay |
+
+## File Formats
+
+### `manifest.json`
+
+Location: `<outputDir>/.remote-sync/manifest.json`
+
+```json
+{
+  "files": {
+    "src/utils/helper.js": {
+      "expectedSize": 4096,
+      "expectedChecksum": "d41d8cd98f00b204e9800998ecf8427e",
+      "bytesWritten": 4096,
+      "lastModified": "2025-01-15T10:30:00.000Z",
+      "status": "complete"
+    },
+    "src/index.js": {
+      "expectedSize": 131072,
+      "expectedChecksum": "abc123...",
+      "bytesWritten": 65536,
+      "lastModified": "2025-01-15T10:30:05.000Z",
+      "status": "partial"
     }
   }
-
-  async drain() {
-    // Wait until all queued tasks are complete
-    if (this.queue.length === 0 && this.active === 0) return;
-    return new Promise((resolve) => {
-      const check = setInterval(() => {
-        if (this.queue.length === 0 && this.active === 0) {
-          clearInterval(check);
-          resolve();
-        }
-      }, 50);
-    });
-  }
 }
-
-module.exports = { ConcurrencyPool };
 ```
 
----
+**Fields per entry:**
 
-## Implementation Priority
+| Field | Type | Description |
+|-------|------|-------------|
+| `expectedSize` | number | Total file size declared by sender |
+| `expectedChecksum` | string \| undefined | Full-file MD5 (omitted if checksums disabled) |
+| `bytesWritten` | number | Bytes successfully written to disk |
+| `lastModified` | string | ISO 8601 timestamp of last activity |
+| `status` | `"partial"` \| `"complete"` | Transfer state |
 
-The recommended implementation order:
+**Persistence:**
+- `markComplete()` always flushes immediately
+- `registerPartial()` flushes every 10 calls (batched for I/O performance)
+- `flushManifest()` called on disconnect (ensures all progress saved)
+- Atomic write: data → `.manifest.json.tmp` → fsync → rename to `manifest.json`
 
-1. **`common/` modules first** — checksum, compression, concurrency (independent, testable)
-2. **Protocol layer** — session-init/ack, file-ack events
-3. **Checksum feature** — sender computes + sends, server verifies + acks
-4. **Compression feature** — add to pipeline (transparent to checksum)
-5. **Parallel sending** — replace sequential loop with concurrency pool
-6. **Resume** — requires checksum to be working first
-7. **CLI options** — wire everything together through Commander.js
-8. **Progress reporting** — multi-line display for parallel transfers
+### `failed-files.json`
+
+Location: sender's working directory (written on exit code 1)
+
+```json
+{
+  "timestamp": "2025-01-15T10:30:00.000Z",
+  "totalFiles": 500,
+  "succeeded": 497,
+  "failed": 3,
+  "failures": [
+    {
+      "file": "src/broken.js",
+      "wireKey": "src/broken.js",
+      "error": "Timeout waiting for ack on 'file-chunk' after 30000ms",
+      "attempts": 4
+    }
+  ]
+}
+```
+
+## Security Considerations
+
+**This tool provides no security.** It is designed for trusted LAN environments only.
+
+- **No encryption** — all data travels as plaintext WebSocket frames
+- **No authentication** — any client can connect to a receiver
+- **No authorization** — any connected client can write any file within `outputDir`
+- **Path traversal protection** — the only security measure: `fromWireKey()` rejects `..`, absolute paths, backslashes, and verifies resolved paths stay within `outputDir`
+- **No rate limiting** — a malicious client could fill disk
+- **No TLS** — vulnerable to MITM on untrusted networks
+
+**Do not expose the receiver port to the internet.** Use only on trusted local networks, behind firewalls.

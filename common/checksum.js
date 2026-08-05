@@ -22,10 +22,13 @@ function computeFileChecksum(filePath) {
 /**
  * Creates a Transform stream that computes MD5 hash as data passes through.
  * Data passes through unchanged. Call getHash() after stream ends to get the checksum.
+ * getHash() caches the result so it is safe to call multiple times (avoids ERR_CRYPTO_HASH_FINALIZED).
  * @returns {Transform & { getHash: () => string }}
  */
 function createHashStream() {
   const hash = crypto.createHash('md5');
+  let _digest = null;
+
   const transform = new Transform({
     transform(chunk, encoding, callback) {
       hash.update(chunk);
@@ -33,7 +36,12 @@ function createHashStream() {
       callback();
     }
   });
-  transform.getHash = () => hash.digest('hex');
+
+  transform.getHash = () => {
+    if (!_digest) _digest = hash.digest('hex');
+    return _digest;
+  };
+
   return transform;
 }
 
